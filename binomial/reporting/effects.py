@@ -2,8 +2,7 @@ import math
 from dataclasses import dataclass
 from fractions import Fraction
 from binomial.fitting.boundary import validate_fit_artifact
-from binomial.fitting.subspace import row_space
-from binomial.fitting.finite import solve_positive_system
+from binomial.fitting.subspace import ExactRowSpace
 from binomial.reporting.covariance import effect_variance
 
 
@@ -50,35 +49,19 @@ class EffectReport:
         return result
 
 
-def _report_coordinates(fit):
-    space = row_space(fit.frozen.x, len(fit.frozen.column_ids))
-    a = tuple(space.coordinates(row) for row in fit.frozen.x)
-    d = len(space.basis)
-    probabilities = tuple(max(1e-8, min(1 - 1e-8, p)) for p in fit.probabilities)
-    logits = tuple(math.log(p) - math.log1p(-p) for p in probabilities)
-    gram = tuple(tuple(math.fsum(float(row[j]) * float(row[l]) for row in a)
-                       for l in range(d)) for j in range(d))
-    rhs = tuple(math.fsum(float(row[j]) * z for row, z in zip(a, logits)) for j in range(d))
-    theta = solve_positive_system(gram, rhs)
-    information = tuple(tuple(math.fsum(float(row[j]) * float(row[l]) * n * p * (1 - p)
-                                        for row, n, p in zip(a, fit.frozen.n, probabilities))
-                              for l in range(d)) for j in range(d))
-    return space, theta, information
-
-
 def evaluate_effects(fit, request):
     validate_fit_artifact(fit)
     if request.column_ids != fit.frozen.column_ids:
         raise ValueError("effect column binding mismatch")
-    space, theta, information = _report_coordinates(fit)
+    space = ExactRowSpace(fit.basis, len(fit.frozen.column_ids))
     items = []
     for index, item in enumerate(request.effects):
         coordinates = space.coordinates(item.coefficients)
         if coordinates is None:
             result = EffectResult(item.name, index, item.coefficients, "not_estimable", None, None)
         else:
-            estimate = math.fsum(float(w) * value for w, value in zip(coordinates, theta))
-            variance = effect_variance(information, coordinates)
+            estimate = math.fsum(float(w) * value for w, value in zip(coordinates, fit.theta))
+            variance = effect_variance(fit.information, coordinates)
             if not math.isfinite(estimate):
                 raise ArithmeticError("nonfinite effect estimate")
             result = EffectResult(item.name, index, item.coefficients, "estimable", estimate, variance)

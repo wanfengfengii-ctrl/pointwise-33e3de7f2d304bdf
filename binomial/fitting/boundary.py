@@ -3,8 +3,9 @@ from dataclasses import dataclass
 from fractions import Fraction
 from binomial.design.compiler import FrozenDesign, validate_frozen_design
 from binomial.fitting.subspace import row_space
-from binomial.fitting.finite import FiniteFit, fit_finite, NumericalFitError, solve_positive_system
+from binomial.fitting.finite import fit_finite, NumericalFitError, solve_positive_system
 from binomial.fitting.likelihood import binomial_log_likelihood, score_and_information
+from binomial.fitting.separation import identify_boundary
 
 
 @dataclass(frozen=True)
@@ -37,47 +38,31 @@ class FitArtifact:
 
 
 
-def _bounded_fit(a, n, k, dimension):
-    theta = (0.0,) * dimension
-    for iteration in range(201):
-        probabilities, score, information = score_and_information(a, n, k, theta)
-        step = solve_positive_system(information, score)
-        candidate = tuple(max(-12.0, min(12.0, value + delta))
-                          for value, delta in zip(theta, step))
-        if max((abs(u - v) for u, v in zip(candidate, theta)), default=0) <= 2e-12:
-            return FiniteFit(theta, probabilities, information, iteration,
-                             max(map(abs, score), default=0.0))
-        old = binomial_log_likelihood(n, k, probabilities)
-        scale = 1.0
-        for _ in range(60):
-            trial = tuple(v + scale * (c - v) for v, c in zip(theta, candidate))
-            p, _, _ = score_and_information(a, n, k, trial)
-            if binomial_log_likelihood(n, k, p) >= old - 2e-13 * max(1.0, abs(old)):
-                theta = trial
-                break
-            scale *= 0.5
-        else:
-            raise NumericalFitError('bounded likelihood line search failed')
-    raise NumericalFitError('bounded likelihood did not converge')
-
-
 def fit_extended(design, finite_solver=fit_finite):
     validate_frozen_design(design)
-    space = row_space(design.x, len(design.column_ids))
-    a = tuple(space.coordinates(row) for row in design.x)
-    try:
-        finite = finite_solver(a, design.n, design.k, len(space.basis))
-    except NumericalFitError:
-        if finite_solver is not fit_finite:
-            raise
-        finite = _bounded_fit(a, design.n, design.k, len(space.basis))
-    diagnostics = {'status': 'finite', 'design_rank': len(space.basis),
+    boundary, examined = identify_boundary(design)
+    internal = tuple(i for i, flag in enumerate(boundary) if flag is None)
+    rows = tuple(design.x[i] for i in internal)
+    space = row_space(rows, len(design.column_ids))
+    a = tuple(space.coordinates(row) for row in rows)
+    finite = finite_solver(a, tuple(design.n[i] for i in internal),
+                           tuple(design.k[i] for i in internal), len(space.basis))
+    positions = {row_index: position for position, row_index in enumerate(internal)}
+    probabilities = tuple(finite.probabilities[positions[i]] if flag is None else flag
+                          for i, flag in enumerate(boundary))
+    if len(internal) == len(design.x):
+        status = 'finite'
+    elif not internal:
+        status = 'complete'
+    else:
+        status = 'quasi'
+    diagnostics = {'status': status, 'design_rank': len(row_space(design.x).basis),
                    'finite_rank': len(space.basis), 'iterations': finite.iterations,
-                   'score_norm': finite.score_norm, 'vertices_examined': 0,
-                   'log_likelihood': binomial_log_likelihood(design.n, design.k, finite.probabilities)}
-    result = FitArtifact(design, finite.probabilities, (None,) * len(design.x),
-                         design.row_ids, space.basis, finite.theta, finite.information,
-                         tuple(sorted(diagnostics.items())))
+                   'score_norm': finite.score_norm, 'vertices_examined': examined,
+                   'log_likelihood': binomial_log_likelihood(design.n, design.k, probabilities)}
+    result = FitArtifact(design, probabilities, boundary,
+                         tuple(design.row_ids[i] for i in internal), space.basis,
+                         finite.theta, finite.information, tuple(sorted(diagnostics.items())))
     return validate_fit_artifact(result)
 
 
